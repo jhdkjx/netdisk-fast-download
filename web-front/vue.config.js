@@ -1,0 +1,130 @@
+
+const path = require("path");
+const { execSync } = require("child_process");
+const webpack = require("webpack");
+
+function resolve(dir) {
+  return path.join(__dirname, dir)
+}
+
+// 从 git remote origin 自动识别 GitHub 仓库地址
+function getGitHubRepoUrl() {
+  try {
+    const remoteUrl = execSync('git remote get-url origin', { encoding: 'utf-8', cwd: path.resolve(__dirname, '..') }).trim();
+    const match = remoteUrl.match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);
+    if (match) return `https://github.com/${match[1]}`;
+  } catch (e) {}
+  return 'https://github.com/qaiu/netdisk-fast-download';
+}
+// 从根 pom.xml 读取项目版本号（单一版本来源）
+function getProjectVersion() {
+  try {
+    const pomContent = require('fs').readFileSync(path.resolve(__dirname, '../pom.xml'), 'utf-8');
+    const match = pomContent.match(/<revision>([^<]+)<\/revision>/);
+    if (match) return match[1];
+  } catch (e) {}
+  return require('./package.json').version;
+}
+const PROJECT_VERSION = getProjectVersion();
+
+const GITHUB_REPO_URL = getGitHubRepoUrl();
+
+const CompressionPlugin = require('compression-webpack-plugin');
+const FileManagerPlugin = require('filemanager-webpack-plugin');
+const MonacoEditorPlugin = require('monaco-editor-webpack-plugin');
+
+module.exports = {
+  productionSourceMap: false, // 是否在构建生产包时生成sourceMap文件，false将提高构建速度
+  transpileDependencies: true,
+  lintOnSave: false,
+  outputDir: 'nfd-front',
+  devServer: {
+    host: '127.0.0.1',
+    port: 6444,
+    proxy: {
+      '/parser': {
+        target: 'http://127.0.0.1:6401/',  // 请求本地
+        ws: false
+      },
+      '/v2': {
+        target: 'http://127.0.0.1:6401/',  // 请求本地
+        ws: false
+      },
+      '/json': {
+        target: 'http://127.0.0.1:6401/',  // 请求本地
+        ws: false
+      },
+      '/d': {
+        target: 'http://127.0.0.1:6401/',  // 请求本地
+        ws: false
+      },
+    }
+  },
+  configureWebpack: {
+    // provide the app's title in webpack's name field, so that
+    // it can be accessed in list.html to inject the correct title.
+    name: 'Netdisk fast download',
+    resolve: {
+      alias: {
+        '@': resolve('src')
+      }
+    },
+    // Monaco Editor配置 - 使用本地打包
+    module: {
+      rules: [
+        {
+          test: /\.ttf$/,
+          type: 'asset/resource'
+        }
+      ]
+    },
+    plugins: [
+      new webpack.DefinePlugin({
+        'process.env.VUE_APP_GITHUB_REPO_URL': JSON.stringify(GITHUB_REPO_URL),
+        'process.env.VUE_APP_VERSION': JSON.stringify(PROJECT_VERSION)
+      }),
+      new MonacoEditorPlugin({
+        languages: ['javascript', 'typescript', 'json'],
+        features: ['coreCommands', 'find', 'format', 'suggest', 'quickCommand'],
+        publicPath: process.env.NODE_ENV === 'production' ? './' : '/',
+        // Worker 文件输出路径
+        filename: 'js/[name].worker.js'
+      }),
+      new CompressionPlugin({
+        test: /\.js$|\.html$|\.css/, // 匹配文件
+        threshold: 10240, // 对超过10k文件压缩
+        // 排除 js 目录下的 worker 文件（Monaco Editor 使用 vs/assets 下的）
+        exclude: /js\/.*\.worker\.js$/
+      }),
+      new FileManagerPlugin({  //初始化 filemanager-webpack-plugin 插件实例
+        events: {
+          onEnd: {
+            mkdir: ['./nfd-front'],
+            delete: [
+              { source: './nfd-front.zip', options: { force: true } },
+              { source: '../webroot/nfd-front', options: { force: true } },
+              { source: './nfd-front/view/.git', options: { force: true } },
+              { source: './nfd-front/view/.gitignore', options: { force: true } },
+              { source: '../webroot/nfd-front/view/.git', options: { force: true } },
+              { source: '../webroot/nfd-front/view/.gitignore', options: { force: true } },
+            ],
+            copy: [
+              // 复制 Monaco Editor 的 vs 目录到 js/vs
+              { 
+                source: './node_modules/monaco-editor/min/vs', 
+                destination: './nfd-front/js/vs' 
+              },
+              { source: './nfd-front', destination: '../webroot/nfd-front' }
+            ],
+            archive: [ //然后我们选择dist文件夹将之打包成dist.zip并放在根目录
+              {
+                source: './nfd-front', destination: './nfd-front.zip', options: {}
+              },
+            ]
+          }
+        }
+      })
+    ]
+  },
+
+}

@@ -1,0 +1,778 @@
+package cn.qaiu.lz.web.controller;
+
+import cn.qaiu.entity.ShareLinkInfo;
+import cn.qaiu.lz.web.config.PlaygroundConfig;
+import cn.qaiu.lz.web.model.PlaygroundTestResp;
+import cn.qaiu.lz.web.service.DbService;
+import cn.qaiu.parser.ParserCreate;
+import cn.qaiu.parser.custom.CustomParserRegistry;
+import cn.qaiu.parser.customjs.JsPlaygroundExecutor;
+import cn.qaiu.parser.customjs.JsPlaygroundLogger;
+import cn.qaiu.parser.customjs.JsScriptMetadataParser;
+import cn.qaiu.vx.core.annotaions.RouteHandler;
+import cn.qaiu.vx.core.annotaions.RouteMapping;
+import cn.qaiu.vx.core.enums.RouteMethod;
+import cn.qaiu.vx.core.model.JsonResult;
+import cn.qaiu.vx.core.util.AsyncServiceUtil;
+import cn.qaiu.vx.core.util.ResponseUtil;
+import io.vertx.core.Future;
+import io.vertx.core.Promise;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.json.JsonObject;
+import io.vertx.ext.web.RoutingContext;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * 演练场API控制器
+ * 提供JavaScript解析脚本的测试接口
+ *
+ * @author <a href="https://qaiu.top">QAIU</a>
+ */
+@RouteHandler(value = "/v2/playground", order = 10)
+@Slf4j
+public class PlaygroundApi {
+
+    private static final int MAX_PARSER_COUNT = 100;
+    private static final int MAX_CODE_LENGTH = 128 * 1024; // 128KB 代码长度限制
+    private final DbService dbService = AsyncServiceUtil.getAsyncServiceInstance(DbService.class);
+    
+    /**
+     * 检查Playground是否启用
+     */
+    private boolean checkEnabled() {
+        PlaygroundConfig config = PlaygroundConfig.getInstance();
+        return config.isEnabled();
+    }
+    
+    /**
+     * 检查Playground访问权限
+     */
+    private boolean checkAuth(RoutingContext ctx) {
+        // 首先检查是否启用
+        if (!checkEnabled()) {
+            return false;
+        }
+        
+        PlaygroundConfig config = PlaygroundConfig.getInstance();
+        
+        // 如果是公开模式，直接允许访问
+        if (config.isPublic()) {
+            return true;
+        }
+        
+        // 检查 Authorization: Bearer <token> 请求头
+        String authHeader = ctx.request().getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ") && authHeader.length() > 7) {
+            String token = authHeader.substring(7).trim();
+            return config.validateToken(token);
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 获取Playground状态（是否需要认证）
+     */
+    @RouteMapping(value = "/status", method = RouteMethod.GET)
+    public Future<JsonObject> getStatus(RoutingContext ctx) {
+        PlaygroundConfig config = PlaygroundConfig.getInstance();
+        boolean enabled = config.isEnabled();
+        boolean authed = enabled && checkAuth(ctx);
+        
+        JsonObject result = new JsonObject()
+                .put("enabled", enabled)
+                .put("public", config.isPublic())
+                .put("authed", authed);
+        
+        return Future.succeededFuture(JsonResult.data(result).toJsonObject());
+    }
+    
+    /**
+     * Playground登录
+     */
+    @RouteMapping(value = "/login", method = RouteMethod.POST)
+    public Future<JsonObject> login(RoutingContext ctx) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        Promise<JsonObject> promise = Promise.promise();
+        
+        try {
+            PlaygroundConfig config = PlaygroundConfig.getInstance();
+            
+            // 如果是公开模式，直接成功（不需要token）
+            if (config.isPublic()) {
+                promise.complete(JsonResult.success("公开模式，无需密码").toJsonObject());
+                return promise.future();
+            }
+            
+            // 获取密码
+            JsonObject body = ctx.body().asJsonObject();
+            if (body == null) {
+                promise.complete(JsonResult.error("请求体不能为空").toJsonObject());
+                return promise.future();
+            }
+            String password = body.getString("password");
+            
+            if (StringUtils.isBlank(password)) {
+                promise.complete(JsonResult.error("密码不能为空").toJsonObject());
+                return promise.future();
+            }
+            
+            // 验证密码（使用常量时间比较防止时序攻击）
+            String storedPassword = config.getPassword();
+            if (storedPassword != null && MessageDigest.isEqual(
+                    storedPassword.getBytes(StandardCharsets.UTF_8),
+                    password.getBytes(StandardCharsets.UTF_8))) {
+                String token = config.generateToken();
+                JsonObject tokenData = new JsonObject().put("token", token);
+                promise.complete(JsonResult.data(tokenData).toJsonObject());
+            } else {
+                promise.complete(JsonResult.error("密码错误").toJsonObject());
+            }
+            
+        } catch (Exception e) {
+            log.error("登录失败", e);
+            promise.complete(JsonResult.error("登录失败: " + e.getMessage()).toJsonObject());
+        }
+        
+        return promise.future();
+    }
+
+    /**
+     * 测试执行JavaScript代码
+     *
+     * @param ctx 路由上下文
+     * @return 测试结果
+     */
+    @RouteMapping(value = "/test", method = RouteMethod.POST)
+    public Future<JsonObject> test(RoutingContext ctx) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            return Future.succeededFuture(JsonResult.error("未授权访问").toJsonObject());
+        }
+        
+        Promise<JsonObject> promise = Promise.promise();
+
+        try {
+            JsonObject body = ctx.body().asJsonObject();
+            String jsCode = body.getString("jsCode");
+            String shareUrl = body.getString("shareUrl");
+            String pwd = body.getString("pwd");
+            String method = body.getString("method", "parse");
+
+            // 参数验证
+            if (StringUtils.isBlank(jsCode)) {
+                promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                        .success(false)
+                        .error("JavaScript代码不能为空")
+                        .build()));
+                return promise.future();
+            }
+            
+            // 代码长度验证
+            if (jsCode.length() > MAX_CODE_LENGTH) {
+                promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                        .success(false)
+                        .error("代码长度超过限制（最大128KB），当前长度: " + jsCode.length() + " 字节")
+                        .build()));
+                return promise.future();
+            }
+
+            if (StringUtils.isBlank(shareUrl)) {
+                promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                        .success(false)
+                        .error("分享链接不能为空")
+                        .build()));
+                return promise.future();
+            }
+            
+            // ===== 新增：验证URL匹配 =====
+            try {
+                var config = JsScriptMetadataParser.parseScript(jsCode);
+                Pattern matchPattern = config.getMatchPattern();
+                
+                if (matchPattern != null) {
+                    Matcher matcher = matchPattern.matcher(shareUrl);
+                    if (!matcher.matches()) {
+                        promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                                .success(false)
+                                .error("分享链接与脚本的@match规则不匹配\n" +
+                                       "规则: " + matchPattern.pattern() + "\n" +
+                                       "链接: " + shareUrl)
+                                .build()));
+                        return promise.future();
+                    }
+                }
+            } catch (IllegalArgumentException e) {
+                promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                        .success(false)
+                        .error("解析脚本元数据失败: " + e.getMessage())
+                        .build()));
+                return promise.future();
+            }
+            // ===== 验证结束 =====
+
+            // 验证方法类型
+            if (!"parse".equals(method) && !"parseFileList".equals(method) && !"parseById".equals(method)) {
+                promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                        .success(false)
+                        .error("方法类型无效，必须是 parse、parseFileList 或 parseById")
+                        .build()));
+                return promise.future();
+            }
+
+            long startTime = System.currentTimeMillis();
+
+            try {
+                // 创建ShareLinkInfo
+                ParserCreate parserCreate = ParserCreate.fromShareUrl(shareUrl);
+                if (StringUtils.isNotBlank(pwd)) {
+                    parserCreate.setShareLinkInfoPwd(pwd);
+                }
+                ShareLinkInfo shareLinkInfo = parserCreate.getShareLinkInfo();
+
+                // 创建演练场执行器
+                final JsPlaygroundExecutor executor = new JsPlaygroundExecutor(shareLinkInfo, jsCode);
+
+                // 根据方法类型选择执行，并异步处理结果
+                Future<Object> executionFuture;
+                try {
+                    switch (method) {
+                        case "parse":
+                            executionFuture = executor.executeParseAsync().map(r -> (Object) r);
+                            break;
+                        case "parseFileList":
+                            executionFuture = executor.executeParseFileListAsync().map(r -> (Object) r);
+                            break;
+                        case "parseById":
+                            executionFuture = executor.executeParseByIdAsync().map(r -> (Object) r);
+                            break;
+                        default:
+                            executor.close();
+                            promise.fail(new IllegalArgumentException("未知的方法类型: " + method));
+                            return promise.future();
+                    }
+                } catch (Exception ex) {
+                    // 同步异常路径：executor 已创建但 Future 未注册，需要手动关闭
+                    executor.close();
+                    throw ex;
+                }
+
+                // 异步处理执行结果，finally 中统一释放 executor，避免响应构建异常导致资源泄漏
+                executionFuture.onComplete(ar -> {
+                    try {
+                        long executionTime = System.currentTimeMillis() - startTime;
+                        List<JsPlaygroundLogger.LogEntry> logEntries = executor.getLogs();
+                        List<PlaygroundTestResp.LogEntry> respLogs = logEntries.stream()
+                                .map(entry -> PlaygroundTestResp.LogEntry.builder()
+                                        .level(entry.getLevel())
+                                        .message(entry.getMessage())
+                                        .timestamp(entry.getTimestamp())
+                                        .source(entry.getSource())
+                                        .build())
+                                .collect(Collectors.toList());
+
+                        if (ar.succeeded()) {
+                            Object result = ar.result();
+                            log.debug("执行成功，结果类型: {}, 结果摘要: {}",
+                                    result != null ? result.getClass().getSimpleName() : "null",
+                                    summarizeResult(result));
+
+                            PlaygroundTestResp response = PlaygroundTestResp.builder()
+                                    .success(true)
+                                    .result(result)
+                                    .logs(respLogs)
+                                    .executionTime(executionTime)
+                                    .build();
+
+                            log.debug("测试成功响应: success=true, logCount={}", respLogs.size());
+                            promise.complete(JsonObject.mapFrom(response));
+                        } else {
+                            Throwable e = ar.cause();
+                            String errorMessage = e == null ? "执行失败" : e.getMessage();
+                            log.error("演练场执行失败", e);
+
+                            PlaygroundTestResp response = PlaygroundTestResp.builder()
+                                    .success(false)
+                                    .error(errorMessage)
+                                    .executionTime(executionTime)
+                                    .logs(respLogs)
+                                    .build();
+
+                            promise.complete(JsonObject.mapFrom(response));
+                        }
+                    } catch (Exception e) {
+                        log.error("构建演练场响应失败", e);
+                        promise.tryComplete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                                .success(false)
+                                .error("构建响应失败: " + e.getMessage())
+                                .build()));
+                    } finally {
+                        executor.close();
+                    }
+                });
+
+            } catch (Exception e) {
+                long executionTime = System.currentTimeMillis() - startTime;
+                String errorMessage = e.getMessage();
+
+                log.error("演练场初始化失败", e);
+
+                PlaygroundTestResp response = PlaygroundTestResp.builder()
+                        .success(false)
+                        .error(errorMessage)
+                        .executionTime(executionTime)
+                        .logs(new ArrayList<>())
+                        .build();
+
+                promise.complete(JsonObject.mapFrom(response));
+            }
+        } catch (Exception e) {
+            log.error("解析请求参数失败", e);
+            promise.complete(JsonObject.mapFrom(PlaygroundTestResp.builder()
+                    .success(false)
+                    .error("解析请求参数失败")
+                    .build()));
+        }
+
+        return promise.future();
+    }
+
+    /**
+     * 获取types.js文件内容
+     *
+     * @param ctx 路由上下文
+     * @param response HTTP响应
+     */
+    @RouteMapping(value = "/types.js", method = RouteMethod.GET)
+    public void getTypesJs(RoutingContext ctx, HttpServerResponse response) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            ResponseUtil.fireJsonResultResponse(response, JsonResult.error("演练场功能已禁用"));
+            return;
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            ResponseUtil.fireJsonResultResponse(response, JsonResult.error("未授权访问"));
+            return;
+        }
+        
+        try (InputStream inputStream = getClass().getClassLoader()
+                .getResourceAsStream("custom-parsers/types.js")) {
+
+            if (inputStream == null) {
+                ResponseUtil.fireJsonResultResponse(response, JsonResult.error("types.js文件不存在"));
+                return;
+            }
+
+            String content = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))
+                    .lines()
+                    .collect(Collectors.joining("\n"));
+
+            response.putHeader("Content-Type", "text/javascript; charset=utf-8")
+                    .end(content);
+
+        } catch (Exception e) {
+            log.error("读取types.js失败", e);
+            ResponseUtil.fireJsonResultResponse(response, JsonResult.error("读取types.js失败: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * 获取解析器列表
+     */
+    @RouteMapping(value = "/parsers", method = RouteMethod.GET)
+    public Future<JsonObject> getParserList(RoutingContext ctx) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            return Future.succeededFuture(JsonResult.error("未授权访问").toJsonObject());
+        }
+        return dbService.getPlaygroundParserList();
+    }
+
+    /**
+     * 保存解析器
+     */
+    @RouteMapping(value = "/parsers", method = RouteMethod.POST)
+    public Future<JsonObject> saveParser(RoutingContext ctx) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            return Future.succeededFuture(JsonResult.error("未授权访问").toJsonObject());
+        }
+        
+        Promise<JsonObject> promise = Promise.promise();
+
+        try {
+            JsonObject body = ctx.body().asJsonObject();
+            String jsCode = body.getString("jsCode");
+
+            if (StringUtils.isBlank(jsCode)) {
+                promise.complete(JsonResult.error("JavaScript代码不能为空").toJsonObject());
+                return promise.future();
+            }
+            
+            // 代码长度验证
+            if (jsCode.length() > MAX_CODE_LENGTH) {
+                promise.complete(JsonResult.error("代码长度超过限制（最大128KB），当前长度: " + jsCode.length() + " 字节").toJsonObject());
+                return promise.future();
+            }
+
+            // 解析元数据
+            try {
+                var config = JsScriptMetadataParser.parseScript(jsCode);
+                String type = config.getType();
+                String displayName = config.getDisplayName();
+                String name = config.getMetadata().get("name");
+                String description = config.getMetadata().get("description");
+                String author = config.getMetadata().get("author");
+                String version = config.getMetadata().get("version");
+                String matchPattern = config.getMatchPattern() != null ? config.getMatchPattern().pattern() : null;
+
+                // 检查数量限制
+                dbService.getPlaygroundParserCount().onSuccess(count -> {
+                    if (count >= MAX_PARSER_COUNT) {
+                        promise.complete(JsonResult.error("解析器数量已达到上限（" + MAX_PARSER_COUNT + "个），请先删除不需要的解析器").toJsonObject());
+                        return;
+                    }
+
+                    // 检查type是否已存在
+                    dbService.playgroundParserTypeExists(type, null).onSuccess(exists -> {
+                        if (exists) {
+                            promise.complete(JsonResult.error("解析器类型 " + type + " 已存在，请使用其他类型标识").toJsonObject());
+                            return;
+                        }
+
+                        // 保存到数据库
+                        JsonObject parser = new JsonObject();
+                        parser.put("name", name);
+                        parser.put("type", type);
+                        parser.put("displayName", displayName);
+                        parser.put("description", description);
+                        parser.put("author", author);
+                        parser.put("version", version);
+                        parser.put("matchPattern", matchPattern);
+                        parser.put("jsCode", jsCode);
+                        parser.put("ip", getClientIp(ctx.request()));
+                        parser.put("enabled", true);
+
+                        try {
+                            CustomParserRegistry.register(config);
+                        } catch (Exception e) {
+                            log.error("注册解析器失败", e);
+                            promise.complete(JsonResult.error("保存失败，注册解析器失败: " + e.getMessage()).toJsonObject());
+                            return;
+                        }
+
+                        dbService.savePlaygroundParser(parser).onSuccess(result -> {
+                            if (!result.getBoolean("success", false)) {
+                                CustomParserRegistry.unregister(type);
+                                promise.complete(JsonResult.error(result.getString("msg", "保存失败")).toJsonObject());
+                                return;
+                            }
+                            log.info("已注册演练场解析器: {} ({})", displayName, type);
+                            promise.complete(JsonResult.success("保存并注册成功").toJsonObject());
+                        }).onFailure(e -> {
+                            CustomParserRegistry.unregister(type);
+                            log.error("保存解析器失败", e);
+                            promise.complete(JsonResult.error("保存失败: " + e.getMessage()).toJsonObject());
+                        });
+                    }).onFailure(e -> {
+                        log.error("检查解析器类型失败", e);
+                        promise.complete(JsonResult.error("检查解析器失败: " + e.getMessage()).toJsonObject());
+                    });
+                }).onFailure(e -> {
+                    log.error("获取解析器数量失败", e);
+                    promise.complete(JsonResult.error("检查解析器数量失败: " + e.getMessage()).toJsonObject());
+                });
+
+            } catch (Exception e) {
+                log.error("解析脚本元数据失败", e);
+                promise.complete(JsonResult.error("解析脚本元数据失败: " + e.getMessage()).toJsonObject());
+            }
+        } catch (Exception e) {
+            log.error("解析请求参数失败", e);
+            promise.complete(JsonResult.error("解析请求参数失败: " + e.getMessage()).toJsonObject());
+        }
+
+        return promise.future();
+    }
+
+    /**
+     * 更新解析器
+     */
+    @RouteMapping(value = "/parsers/:id", method = RouteMethod.PUT)
+    public Future<JsonObject> updateParser(RoutingContext ctx, Long id) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            return Future.succeededFuture(JsonResult.error("未授权访问").toJsonObject());
+        }
+        
+        Promise<JsonObject> promise = Promise.promise();
+
+        try {
+            JsonObject body = ctx.body().asJsonObject();
+            String jsCode = body.getString("jsCode");
+
+            if (StringUtils.isBlank(jsCode)) {
+                promise.complete(JsonResult.error("JavaScript代码不能为空").toJsonObject());
+                return promise.future();
+            }
+
+            if (jsCode.length() > MAX_CODE_LENGTH) {
+                promise.complete(JsonResult.error("代码长度超过限制（最大128KB），当前长度: " + jsCode.length() + " 字节").toJsonObject());
+                return promise.future();
+            }
+
+            // 解析元数据
+            try {
+                var config = JsScriptMetadataParser.parseScript(jsCode);
+                String type = config.getType();
+                String displayName = config.getDisplayName();
+                String name = config.getMetadata().get("name");
+                String description = config.getMetadata().get("description");
+                String author = config.getMetadata().get("author");
+                String version = config.getMetadata().get("version");
+                String matchPattern = config.getMatchPattern() != null ? config.getMatchPattern().pattern() : null;
+                boolean enabled = body.getBoolean("enabled", true);
+
+                JsonObject parser = new JsonObject();
+                parser.put("type", type);
+                parser.put("name", name);
+                parser.put("displayName", displayName);
+                parser.put("description", description);
+                parser.put("author", author);
+                parser.put("version", version);
+                parser.put("matchPattern", matchPattern);
+                parser.put("jsCode", jsCode);
+                parser.put("enabled", enabled);
+
+                dbService.getPlaygroundParserById(id).onSuccess(oldResult -> {
+                    String oldType = null;
+                    if (oldResult.getBoolean("success", false) && oldResult.getJsonObject("data") != null) {
+                        oldType = oldResult.getJsonObject("data").getString("type");
+                    } else {
+                        promise.complete(JsonResult.error("解析器不存在").toJsonObject());
+                        return;
+                    }
+                    final String oldRegisteredType = oldType;
+                    dbService.playgroundParserTypeExists(type, id).onSuccess(exists -> {
+                        if (exists) {
+                            promise.complete(JsonResult.error("解析器类型 " + type + " 已被其他解析器使用").toJsonObject());
+                            return;
+                        }
+
+                        var oldConfig = CustomParserRegistry.get(oldRegisteredType);
+                        boolean removedOldType = false;
+                        boolean registeredNewType = false;
+                        try {
+                            if (StringUtils.isNotBlank(oldRegisteredType)) {
+                                removedOldType = CustomParserRegistry.unregister(oldRegisteredType);
+                            }
+                            if (enabled) {
+                                CustomParserRegistry.register(config);
+                                registeredNewType = true;
+                            }
+                        } catch (Exception e) {
+                            if (removedOldType && oldConfig != null) {
+                                try {
+                                    CustomParserRegistry.register(oldConfig);
+                                } catch (Exception restoreError) {
+                                    log.warn("恢复旧解析器注册失败: {}", oldRegisteredType, restoreError);
+                                }
+                            }
+                            log.error("预注册解析器失败", e);
+                            promise.complete(JsonResult.error("更新失败，注册解析器失败: " + e.getMessage()).toJsonObject());
+                            return;
+                        }
+                        final boolean shouldRollbackNewType = registeredNewType;
+                        final boolean shouldRestoreOldType = removedOldType;
+                        final var oldParserConfig = oldConfig;
+
+                        dbService.updatePlaygroundParser(id, parser).onSuccess(result -> {
+                            if (!result.getBoolean("success", false)) {
+                                rollbackParserRegistration(type, oldRegisteredType, shouldRollbackNewType,
+                                        shouldRestoreOldType, oldParserConfig);
+                                promise.complete(JsonResult.error(result.getString("msg", "更新失败")).toJsonObject());
+                                return;
+                            }
+                            if (!enabled) {
+                                log.info("已注销演练场解析器: {}", oldRegisteredType);
+                            } else {
+                                log.info("已重新注册演练场解析器: {} ({})", displayName, type);
+                            }
+                            promise.complete(JsonResult.success("更新并重新注册成功").toJsonObject());
+                        }).onFailure(e -> {
+                            rollbackParserRegistration(type, oldRegisteredType, shouldRollbackNewType,
+                                    shouldRestoreOldType, oldParserConfig);
+                            log.error("更新解析器失败", e);
+                            promise.complete(JsonResult.error("更新失败: " + e.getMessage()).toJsonObject());
+                        });
+                    }).onFailure(e -> {
+                        log.error("检查解析器类型失败", e);
+                        promise.complete(JsonResult.error("更新失败: " + e.getMessage()).toJsonObject());
+                    });
+                }).onFailure(e -> {
+                    log.error("获取旧解析器信息失败", e);
+                    promise.complete(JsonResult.error("更新失败: " + e.getMessage()).toJsonObject());
+                });
+
+            } catch (Exception e) {
+                log.error("解析脚本元数据失败", e);
+                promise.complete(JsonResult.error("解析脚本元数据失败: " + e.getMessage()).toJsonObject());
+            }
+        } catch (Exception e) {
+            log.error("解析请求参数失败", e);
+            promise.complete(JsonResult.error("解析请求参数失败: " + e.getMessage()).toJsonObject());
+        }
+
+        return promise.future();
+    }
+
+    private void rollbackParserRegistration(String newType, String oldType, boolean rollbackNewType,
+                                            boolean restoreOldType, cn.qaiu.parser.custom.CustomParserConfig oldConfig) {
+        if (rollbackNewType) {
+            try {
+                CustomParserRegistry.unregister(newType);
+            } catch (Exception rollbackError) {
+                log.warn("回滚新解析器注册失败: {}", newType, rollbackError);
+            }
+        }
+        if (restoreOldType && oldConfig != null) {
+            try {
+                CustomParserRegistry.register(oldConfig);
+            } catch (Exception restoreError) {
+                log.warn("恢复旧解析器注册失败: {}", oldType, restoreError);
+            }
+        }
+    }
+
+    /**
+     * 删除解析器
+     */
+    @RouteMapping(value = "/parsers/:id", method = RouteMethod.DELETE)
+    public Future<JsonObject> deleteParser(RoutingContext ctx, Long id) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            return Future.succeededFuture(JsonResult.error("未授权访问").toJsonObject());
+        }
+        
+        Promise<JsonObject> promise = Promise.promise();
+        
+        // 先获取解析器信息，用于注销
+        dbService.getPlaygroundParserById(id).onSuccess(getResult -> {
+            if (getResult.getBoolean("success", false)) {
+                JsonObject parser = getResult.getJsonObject("data");
+                String type = parser.getString("type");
+                
+                // 删除数据库记录
+                dbService.deletePlaygroundParser(id).onSuccess(deleteResult -> {
+                    // 从注册表中注销
+                    try {
+                        CustomParserRegistry.unregister(type);
+                        log.info("已注销演练场解析器: {}", type);
+                    } catch (Exception e) {
+                        log.warn("注销解析器失败（可能未注册）: {}", type, e);
+                    }
+                    promise.complete(deleteResult);
+                }).onFailure(e -> {
+                    log.error("删除解析器失败", e);
+                    promise.complete(JsonResult.error("删除失败: " + e.getMessage()).toJsonObject());
+                });
+            } else {
+                promise.complete(getResult);
+            }
+        }).onFailure(e -> {
+            log.error("获取解析器信息失败", e);
+            promise.complete(JsonResult.error("获取解析器信息失败: " + e.getMessage()).toJsonObject());
+        });
+        
+        return promise.future();
+    }
+
+    /**
+     * 根据ID获取解析器
+     */
+    @RouteMapping(value = "/parsers/:id", method = RouteMethod.GET)
+    public Future<JsonObject> getParserById(RoutingContext ctx, Long id) {
+        // 检查是否启用
+        if (!checkEnabled()) {
+            return Future.succeededFuture(JsonResult.error("演练场功能已禁用").toJsonObject());
+        }
+        
+        // 权限检查
+        if (!checkAuth(ctx)) {
+            return Future.succeededFuture(JsonResult.error("未授权访问").toJsonObject());
+        }
+        return dbService.getPlaygroundParserById(id);
+    }
+
+    /**
+     * 获取客户端IP
+     */
+    private String getClientIp(HttpServerRequest request) {
+        String ip = request.getHeader("X-Forwarded-For");
+        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
+            ip = request.getHeader("X-Real-IP");
+        }
+        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
+            ip = request.remoteAddress().host();
+        }
+        return ip;
+    }
+
+    private String summarizeResult(Object result) {
+        if (result == null) {
+            return "null";
+        }
+        if (result instanceof String str) {
+            return "String(length=" + str.length() + ")";
+        }
+        if (result instanceof List<?> list) {
+            return "List(size=" + list.size() + ")";
+        }
+        return result.getClass().getSimpleName();
+    }
+}
+

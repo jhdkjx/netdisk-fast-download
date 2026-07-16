@@ -1,0 +1,176 @@
+# Monaco Editor NPM包配置说明
+
+## ✅ 已完成的配置
+
+### 1. NPM包安装
+已在 `package.json` 中安装：
+- `monaco-editor`: ^0.55.1 - Monaco Editor核心包
+- `@monaco-editor/loader`: ^1.4.0 - Monaco Editor加载器
+- `monaco-editor-webpack-plugin`: ^7.1.1 - Webpack打包插件（devDependencies）
+
+### 2. Webpack配置
+在 `vue.config.js` 中已配置：
+```javascript
+new MonacoEditorPlugin({
+  languages: ['javascript', 'typescript', 'json'],
+  features: ['coreCommands', 'find'],
+  publicPath: process.env.NODE_ENV === 'production' ? './' : '/'
+})
+```
+
+### 3. 组件配置
+在 `MonacoEditor.vue` 和 `Playground.vue` 中已配置：
+```javascript
+// 配置loader使用本地打包的文件，而不是CDN
+if (loader.config) {
+  const vsPath = process.env.NODE_ENV === 'production' 
+    ? './js/vs'  // 生产环境使用相对路径
+    : '/js/vs';  // 开发环境使用绝对路径
+  
+  loader.config({ 
+    paths: { 
+      vs: vsPath
+    }
+  });
+}
+```
+
+---
+
+## 🔍 工作原理
+
+### 打包流程
+1. `monaco-editor-webpack-plugin` 在构建时将 Monaco Editor 文件打包到 `js/vs/` 目录
+2. `@monaco-editor/loader` 通过配置的路径加载本地文件
+3. 不再从 CDN（如 `https://cdn.jsdelivr.net`）加载
+
+### 文件结构（构建后）
+```
+nfd-front/
+  ├── js/
+  │   └── vs/
+  │       ├── editor/
+  │       ├── loader/
+  │       ├── base/
+  │       └── ...
+  └── index.html
+```
+
+---
+
+## 🧪 验证方法
+
+### 1. 检查网络请求
+打开浏览器开发者工具 → Network标签：
+- ✅ 应该看到请求 `/js/vs/...` 或 `./js/vs/...`
+- ❌ 不应该看到请求 `cdn.jsdelivr.net` 或其他CDN域名
+
+### 2. 检查构建产物
+```bash
+cd web-front
+npm run build
+ls -la nfd-front/js/vs/
+```
+应该看到 Monaco Editor 的文件被打包到本地。
+
+### 3. 离线测试
+1. 断开网络连接
+2. 访问 Playground 页面
+3. ✅ 编辑器应该正常加载（因为使用本地文件）
+4. ❌ 如果使用CDN，编辑器会加载失败
+
+---
+
+## 📝 修改的文件
+
+1. ✅ `web-front/src/components/MonacoEditor.vue`
+   - 添加了 `loader.config()` 配置，明确使用本地路径
+
+2. ✅ `web-front/src/views/Playground.vue`
+   - 在 `initMonacoTypes()` 中添加了相同的配置
+
+3. ✅ `web-front/vue.config.js`
+   - 添加了 `publicPath` 配置，确保路径正确
+
+---
+
+## 🚀 部署
+
+### 开发环境
+```bash
+cd web-front
+npm install  # 确保依赖已安装
+npm run serve
+```
+访问 `http://127.0.0.1:6444/playground`，编辑器应该从本地加载。
+
+### 生产环境
+```bash
+cd web-front
+npm run build
+```
+构建后，Monaco Editor 文件会打包到 `nfd-front/js/vs/` 目录。
+
+---
+
+## ⚠️ 注意事项
+
+### 1. 文件大小
+Monaco Editor 打包后会增加构建产物大小（约2-3MB），但这是正常的。
+
+### 2. 首次加载
+- 开发环境：文件从 webpack dev server 加载
+- 生产环境：文件从本地 `js/vs/` 目录加载
+
+### 3. 缓存
+浏览器会缓存 Monaco Editor 文件，更新后可能需要清除缓存。
+
+---
+
+## 🔧 故障排查
+
+### 问题：编辑器无法加载
+**检查**：
+1. 确认 `npm install` 已执行
+2. 检查浏览器控制台是否有错误
+3. 检查 Network 标签，确认文件路径是否正确
+
+### 问题：仍然从CDN加载
+**解决**：
+1. 清除浏览器缓存
+2. 确认 `loader.config()` 已正确配置
+3. 检查 `vue.config.js` 中的 `publicPath` 配置
+
+### 问题：构建后路径错误
+**解决**：
+- 检查 `publicPath` 配置
+- 确认生产环境的相对路径 `./js/vs` 正确
+
+---
+
+## ✅ 优势
+
+1. **离线可用** - 不依赖外部CDN
+2. **加载速度** - 本地文件通常比CDN更快
+3. **版本控制** - 使用固定版本的Monaco Editor
+4. **安全性** - 不依赖第三方CDN服务
+5. **稳定性** - CDN故障不影响使用
+
+---
+
+**配置状态**: ✅ 已完成  
+**验证状态**: ⚠️ 待测试  
+**建议**: 运行 `npm run build` 并检查构建产物
+
+
+
+
+
+
+
+
+
+
+
+
+
